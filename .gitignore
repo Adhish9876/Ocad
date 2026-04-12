@@ -4,13 +4,13 @@ __pycache__/
 *$py.class
 local_settings.py
 
-# Models (large files)
-*.pt
-*.onnx
-*.weights
+# Models (commented out to allow small models for now)
+# *.pt
+# *.onnx
+# *.weights
 
 # YOLO/Training
-runs/
+# runs/
 training.log
 
 # Data/Datasets
