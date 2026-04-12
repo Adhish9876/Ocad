@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+local_settings.py
+
+# Models (large files)
+*.pt
+*.onnx
+*.weights
+
+# YOLO/Training
+runs/
+training.log
+
+# Data/Datasets
+labels/
+images/
+saliva_data.yaml
+
+# OS/IDE
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Results/Captures
+smd_captures/
+spot_004_results.json
+test_results.json
+test_model_output.jpg
+detection_visualization.jpg
