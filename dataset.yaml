@@ -1,0 +1,8 @@
+path: C:\Users\adhis\OneDrive\Documents\react-js\Strip Deep.v1i.yolov5pytorch
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names:
+  - spot
