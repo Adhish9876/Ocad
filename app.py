@@ -4,32 +4,37 @@ Flask Backend for OralScan Dashboard
 Connects strip_analysis.py to the HTML dashboard.
 Also drives PiCamera2 + ULN2003 stepper motor for Raspberry Pi 5 deployment.
 
+*** ALL FRAMES ARE RGB — NO BGR ANYWHERE IN THE PIPELINE ***
+
 Install dependencies (Pi):
-    pip install flask flask-cors picamera2 RPi.GPIO opencv-python-headless numpy
-    pip install edge_impulse_linux   # Edge Impulse Linux SDK
+    pip install flask flask-cors picamera2 RPi.GPIO opencv-python-headless numpy ultralytics Pillow
 
 Run:
     python app.py
 
 Then open: http://localhost:5000
+leooooooooooooooooooo
+das
 """
 
 from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 import os
+import io
 import tempfile
 import base64
 import threading
 import time
 import json
 from datetime import datetime
+from PIL import Image
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STEPPER MOTOR CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 USE_STEPPER   = True
 MOTOR_PINS    = [17, 18, 27, 22]   # IN1..IN4 → BCM GPIO
-STEP_DELAY    = 0.003              # seconds between half-steps (medium speed)
+MOTOR_DELAY   = 0.008              # single slow speed (seconds per half-step)
 
 HALF_STEP_SEQ = [
     [1, 0, 0, 0],
@@ -72,221 +77,15 @@ import cv2
 import numpy as np
 
 PREVIEW_W, PREVIEW_H = 1640, 1232   # Half-sensor resolution — faster streaming
+PICAMERA_OUTPUT_IS_BGR = os.getenv("PICAMERA_OUTPUT_IS_BGR", "1").lower() in ("1", "true", "yes", "on")
 
 OUTPUT_DIR = os.path.expanduser("~/smd_captures")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  EDGE IMPULSE MODEL SETUP
+#  MOTOR DRIVER (background thread)  — SIMPLIFIED: single slow speed
 # ─────────────────────────────────────────────────────────────────────────────
-EIM_MODEL_PATH = '/home/pi/model.eim'
-
-EI_CONFIDENCE_THRESHOLD = 0.4   # minimum confidence to accept a detection
-
-# Labels your Edge Impulse model was trained with (edit to match your project):
-# These correspond to the analytes detected by the saliva strip.
-EI_LABELS = ["Cysteine", "Glutathione", "Sialic Acid"]
-
-_ei_runner = None
-_ei_model_params = None
-
-def _load_ei_model():
-    """Load the Edge Impulse .eim model. Called once at startup."""
-    global _ei_runner, _ei_model_params
-    try:
-        from edge_impulse_linux.image import ImageImpulseRunner
-        _ei_runner = ImageImpulseRunner(EIM_MODEL_PATH)
-        _ei_model_params = _ei_runner.init()
-        print(f"[EI] Model loaded: {_ei_model_params['project']['name']}")
-        print(f"[EI] Labels: {_ei_model_params['model_parameters']['labels']}")
-        print(f"[EI] Input: {_ei_model_params['model_parameters']['image_input_width']}"
-              f"x{_ei_model_params['model_parameters']['image_input_height']}")
-    except Exception as e:
-        print(f"[ERROR] Failed to load Edge Impulse model: {e}")
-        _ei_runner = None
-
-
-def run_ei_inference(image_path):
-    """
-    Run Edge Impulse inference on an image file.
-
-    Returns detections or None on failure.
-    """
-    global _ei_runner, _ei_model_params
-
-    if _ei_runner is None:
-        print("[EI] Runner not initialised — cannot run inference.")
-        return None
-
-    try:
-        # Read image
-        img_bgr = cv2.imread(image_path)
-        if img_bgr is None:
-            print(f"[EI] Cannot read image: {image_path}")
-            return None
-
-        # ✅ FIX: Convert to GRAYSCALE (your model expects 1 channel)
-        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-        # Resize to model input size
-        w = _ei_model_params['model_parameters']['image_input_width']
-        h = _ei_model_params['model_parameters']['image_input_height']
-
-        img_resized = cv2.resize(img_gray, (w, h))
-
-        # Flatten → correct size now
-        features = img_resized.flatten().tolist()
-
-        # 🔍 Debug (optional)
-        # print("Expected:", len(_ei_runner._input_shm['array']))
-        # print("Got:", len(features))
-
-        # Run inference
-        result = _ei_runner.classify(features)
-
-        detections = []
-
-        # Object detection
-        if "bounding_boxes" in result["result"]:
-            for bb in result["result"]["bounding_boxes"]:
-                if bb["value"] >= EI_CONFIDENCE_THRESHOLD:
-                    detections.append({
-                        "label":  bb["label"],
-                        "value":  bb["value"],
-                        "x":      bb["x"],
-                        "y":      bb["y"],
-                        "width":  bb["width"],
-                        "height": bb["height"],
-                    })
-
-        # Classification fallback
-        elif "classification" in result["result"]:
-            for label, confidence in result["result"]["classification"].items():
-                if confidence >= EI_CONFIDENCE_THRESHOLD:
-                    detections.append({
-                        "label":  label,
-                        "value":  confidence,
-                        "x":      0,
-                        "y":      0,
-                        "width":  w,
-                        "height": h,
-                    })
-
-        return detections
-
-    except Exception as e:
-        print(f"[EI] Inference error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-def ei_detections_to_results(detections, image_path):
-    """
-    Convert Edge Impulse detections into the same results dict
-    that _format_results() expects.
-
-    Maps detected labels to analyte slots (Cysteine, Glutathione, Sialic Acid).
-    Reads average RGB from the detected bounding-box region of the source image.
-    """
-    img_bgr = cv2.imread(image_path)
-    ih, iw = img_bgr.shape[:2] if img_bgr is not None else (1, 1)
-
-    w_in = _ei_model_params['model_parameters']['image_input_width']  if _ei_model_params else iw
-    h_in = _ei_model_params['model_parameters']['image_input_height'] if _ei_model_params else ih
-
-    def get_avg_rgb(x, y, bw, bh):
-        """Return mean BGR→RGB of the detection region, scaled to source image."""
-        if img_bgr is None:
-            return [128, 128, 128]
-        sx = int(x  * iw / w_in)
-        sy = int(y  * ih / h_in)
-        ex = int((x + bw) * iw / w_in)
-        ey = int((y + bh) * ih / h_in)
-        sx, sy = max(0, sx), max(0, sy)
-        ex, ey = min(iw, ex), min(ih, ey)
-        if ex <= sx or ey <= sy:
-            return [128, 128, 128]
-        roi = img_bgr[sy:ey, sx:ex]
-        mean = roi.mean(axis=(0, 1))   # BGR order
-        return [int(mean[2]), int(mean[1]), int(mean[0])]   # RGB
-
-    # Index detections by label (use highest-confidence per label)
-    det_by_label = {}
-    for d in detections:
-        lbl = d["label"]
-        if lbl not in det_by_label or d["value"] > det_by_label[lbl]["value"]:
-            det_by_label[lbl] = d
-
-    def make_analyte(label):
-        d = det_by_label.get(label)
-        if d is None:
-            return None
-        rgb = get_avg_rgb(d["x"], d["y"], d["width"], d["height"])
-        # Derive a pseudo concentration_level (0–19) from confidence
-        concentration_level = int(d["value"] * 19)
-        concentration_pct   = d["value"] * 100.0
-        return {
-            "analyte":            label,
-            "confidence":         d["value"],
-            "rgb":                rgb,
-            "concentration_level": concentration_level,
-            "concentration_pct":   concentration_pct,
-            "bbox":               {
-                "x": d["x"], "y": d["y"],
-                "width": d["width"], "height": d["height"],
-            },
-        }
-
-    analytes_found = [make_analyte(lbl) for lbl in EI_LABELS]
-    analytes_found = [a for a in analytes_found if a is not None]
-
-    cys  = det_by_label.get("Cysteine")
-    glut = det_by_label.get("Glutathione")
-    sial = det_by_label.get("Sialic Acid")
-
-    cys_risk  = cys["value"]  if cys  else 0.0
-    glut_risk = glut["value"] if glut else 0.0
-    sial_risk = sial["value"] if sial else 0.0
-
-    # Simple weighted average cancer risk
-    weights   = [0.4, 0.3, 0.3]
-    risks     = [cys_risk, glut_risk, sial_risk]
-    pct       = sum(w * r for w, r in zip(weights, risks)) * 100.0
-
-    if pct < 30:
-        category, emoji = "Low Risk", "🟢"
-    elif pct < 60:
-        category, emoji = "Moderate Risk", "🟡"
-    else:
-        category, emoji = "High Risk", "🔴"
-
-    return {
-        "detections": analytes_found,
-        "cancer_risk": {
-            "percentage": pct,
-            "category":   category,
-            "emoji":      emoji,
-            "cys_risk":   cys_risk,
-            "glut_risk":  glut_risk,
-            "sial_risk":  sial_risk,
-        },
-        "biomarkers": {
-            "cysteine_detected":    cys  is not None,
-            "glutathione_detected": glut is not None,
-            "sialic_acid_detected": sial is not None,
-        },
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MOTOR DRIVER (background thread)  — v4: variable-speed via delay control
-# ─────────────────────────────────────────────────────────────────────────────
-STEP_FAST  = 0.005   # fastest — searching
-STEP_SLOW  = 0.015   # medium  — approaching
-STEP_CRAWL = 0.030   # slowest — about to capture
-
 _motor_running = False
-_motor_delay   = STEP_FAST
 _motor_lock    = threading.Lock()
 _motor_thread  = None
 
@@ -296,7 +95,6 @@ def _step_loop():
     while True:
         with _motor_lock:
             should_run = _motor_running
-            delay      = _motor_delay
         if not should_run:
             if _gpio_ok:
                 for dev in _motor_devices:
@@ -311,7 +109,7 @@ def _step_loop():
                 else:
                     dev.off()
         seq_index += 1
-        time.sleep(delay)
+        time.sleep(MOTOR_DELAY)
 
 
 def _ensure_motor_thread():
@@ -321,38 +119,36 @@ def _ensure_motor_thread():
         _motor_thread.start()
 
 
-def motor_go(d=STEP_FAST):
-    global _motor_running, _motor_delay
+def motor_go():
+    global _motor_running
     _ensure_motor_thread()
     with _motor_lock:
         _motor_running = True
-        _motor_delay   = d
-    print(f"[MOTOR] ON  {d*1000:.0f}ms/half-step")
-
-
-def motor_speed(d):
-    """Adjust step delay without stopping the motor."""
-    global _motor_delay
-    with _motor_lock:
-        _motor_delay = d
+    print(f"[MOTOR] ON  (delay={MOTOR_DELAY*1000:.0f}ms/half-step)")
 
 
 def motor_stop():
     global _motor_running
     with _motor_lock:
         _motor_running = False
+    # De-energise all coils immediately
+    if _gpio_ok:
+        for dev in _motor_devices:
+            dev.off()
     print("[MOTOR] OFF")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CAMERA HELPERS
+#  CAMERA HELPERS — *** ALL FRAMES ARE RGB ***
 # ─────────────────────────────────────────────────────────────────────────────
 _cam = None
 _cam_lock = threading.Lock()
-_latest_frame = None
+_latest_frame = None          # always RGB, never BGR
 _cam_thread_running = False
 
+
 def _cam_worker():
+    """Background thread that continuously grabs RGB frames."""
     global _latest_frame
     while _cam_thread_running:
         with _cam_lock:
@@ -361,24 +157,33 @@ def _cam_worker():
                 continue
             try:
                 if USE_PICAMERA:
-                    arr = _cam.capture_array()
+                    # PiCamera2 output can still arrive as BGR depending on platform/config.
+                    # Normalise once here so the rest of the pipeline is always RGB.
+                    f = _cam.capture_array()
+                    if f is not None and len(f.shape) == 3 and f.shape[2] == 3 and PICAMERA_OUTPUT_IS_BGR:
+                        f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
                 else:
-                    ok, f = _cam.read()
-                    if not ok: f = None
+                    # OpenCV webcam gives BGR → convert to RGB
+                    ok, bgr = _cam.read()
+                    if ok:
+                        f = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    else:
+                        f = None
             except Exception:
                 f = None
-        
+
         if f is not None:
             _latest_frame = f
         else:
             time.sleep(0.01)
+
 
 def open_camera():
     global _cam, _cam_thread_running
     with _cam_lock:
         if _cam is not None:
             return _cam
-        
+
         if not USE_PICAMERA:
             _cam = cv2.VideoCapture(0)
             _cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -411,7 +216,7 @@ def open_camera():
 
 
 def grab_frame():
-    """Returns the latest frame from the fast background camera thread."""
+    """Returns the latest RGB frame (never BGR)."""
     if _latest_frame is None:
         return None
     return _latest_frame.copy()
@@ -433,62 +238,63 @@ def release_camera():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SMD DETECTION HELPERS  — v4: shape-based, colour-agnostic
+#  STRIP DETECTION — WHITE-MASK on RED BACKGROUND (colour-based, RGB input)
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_CAPTURES = 10
 
+# Aspect ratio: width / height  (2.8 cm wide, 3.0 cm tall → 0.933)
 TARGET_ASPECT    = 2.8 / 3.0
+ASPECT_TOL       = 0.40      # accepts 0.53 … 1.33 (generous for tilt/perspective)
 
-MIN_FILL = 0.005     # allow smaller objects
-MAX_FILL = 0.95
+MIN_FILL = 0.015   # ~1.5%
+MAX_FILL = 0.85
 
-MIN_RECT_SCORE = 0.25   # was too strict
-
-ASPECT_TOL = 1.0     # allow more shapes (critical)
+MIN_RECT_SCORE       = 0.50
 CONFIDENCE_THRESHOLD = 0.30
 CONFIRM_FRAMES       = 3
-SETTLE_TIME          = 0.35
-SHOW_CAPTURED_SEC    = 1.2
-COOLDOWN_SEC         = 1.0
-SMOOTH_ALPHA         = 0.40
-EDGE_FRAC            = 0.20
-CENTRE_MARGIN        = 25
+SETTLE_TIME          = 1.5    # wait 1.5s after motor stop before capture
+COOLDOWN_SEC         = 0.5    # short pause after capture before resuming motor
 
 
-def find_component(frame):
+def find_component(frame_rgb):
     """
-    Shape-based detection — colour agnostic.
-    Returns (bbox, score) or (None, 0).
+    Detect the white strip on a red background using colour masking.
+
+    Input : RGB frame (numpy array)
+    Output: (bbox, score, contour) or (None, 0, None)
+
+    Pipeline:
+    1. Downscale 2× for speed
+    2. RGB → HSV
+    3. White mask: low Saturation (0-60), high Value (160-255)
+    4. Morphological close + dilate to fill holes
+    5. Find contours → filter by fill, aspect ratio, rectangularity
+    6. Return best match with its contour (needed for perspective crop)
     """
-    fh, fw = frame.shape[:2]
-    small  = cv2.resize(frame, (fw // 2, fh // 2))
+    fh, fw = frame_rgb.shape[:2]
+    small = cv2.resize(frame_rgb, (fw // 2, fh // 2))
     sh, sw = small.shape[:2]
     s_area = sh * sw
 
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    gray  = clahe.apply(gray)
+    # RGB → HSV (OpenCV's cvtColor with COLOR_RGB2HSV works on RGB input)
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
 
-    blurred5 = cv2.GaussianBlur(gray, (5, 5), 0)
-    blurred7 = cv2.GaussianBlur(gray, (7, 7), 0)
+    # White mask: any hue, low saturation, high value
+    # White objects have S < 60 and V > 160 typically
+    lower_white = np.array([0,   0, 160], dtype=np.uint8)
+    upper_white = np.array([180, 60, 255], dtype=np.uint8)
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
 
-    thresh = cv2.adaptiveThreshold(
-        blurred7, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
-        31, 4
-    )
-    canny = cv2.Canny(blurred5, 15, 60)
-    combined = cv2.bitwise_or(thresh, canny)
-
-    k_close  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    # Clean up the mask
+    k_close  = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE,  k_close,  iterations=2)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_DILATE, k_dilate, iterations=1)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE,  k_close,  iterations=3)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_DILATE, k_dilate, iterations=1)
 
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
-    best_bbox, best_score = None, 0.0
+    best_bbox, best_score, best_contour = None, 0.0, None
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -505,49 +311,103 @@ def find_component(frame):
             continue
 
         rect_fill = area / (bw * bh)
+        if rect_fill < MIN_RECT_SCORE:
+            continue
 
-        asp_score = max(0, 1.0 - abs(aspect - TARGET_ASPECT) / ASPECT_TOL)
-        score = 0.6 * asp_score + 0.4 * rect_fill
+        asp_penalty = 1.0 - abs(aspect - TARGET_ASPECT) / ASPECT_TOL
+        score = rect_fill * asp_penalty
 
-        print(f"  [DBG] fill={fill:.4f} asp={aspect:.3f} "
+        print(f"  [DET] fill={fill:.4f} asp={aspect:.3f} "
               f"rect={rect_fill:.2f} score={score:.3f}")
 
         if score > best_score:
-            best_score = score
-            best_bbox  = (x * 2, y * 2, bw * 2, bh * 2)
-            
-        # Fallback: if nothing found, pick largest contour
-        if best_bbox is None and contours:
-            cnt = max(contours, key=cv2.contourArea)
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            best_bbox = (x * 2, y * 2, bw * 2, bh * 2)
-            best_score = 0.3   # force minimal confidence
+            best_score   = score
+            best_bbox    = (x * 2, y * 2, bw * 2, bh * 2)   # scale back to full res
+            # Scale contour back to full resolution
+            best_contour = cnt * 2
 
-    return best_bbox, best_score
+    return best_bbox, best_score, best_contour
 
 
-def smooth_bbox(prev, curr, alpha=SMOOTH_ALPHA):
+def crop_and_align(frame_rgb, contour):
+    """
+    Perspective-correct and tightly crop the detected strip.
+
+    Uses cv2.minAreaRect → getPerspectiveTransform to straighten
+    the strip edges, then crops to just the object.
+
+    Input : RGB frame, contour (at full resolution)
+    Output: cropped RGB numpy array (just the strip, no background)
+    """
+    if contour is None or len(contour) < 4:
+        return None
+
+    # Get the minimum-area rotated rectangle
+    rect = cv2.minAreaRect(contour)
+    box_pts = cv2.boxPoints(rect).astype(np.float32)
+
+    # Order points: top-left, top-right, bottom-right, bottom-left
+    box_pts = _order_points(box_pts)
+
+    # Compute output dimensions (preserve the strip's actual w/h ratio)
+    w = int(max(
+        np.linalg.norm(box_pts[0] - box_pts[1]),
+        np.linalg.norm(box_pts[2] - box_pts[3])
+    ))
+    h = int(max(
+        np.linalg.norm(box_pts[0] - box_pts[3]),
+        np.linalg.norm(box_pts[1] - box_pts[2])
+    ))
+
+    if w < 20 or h < 20:
+        return None
+
+    # Ensure width < height (strip is taller than wide: 3.0 cm tall, 2.8 cm wide)
+    if w > h:
+        w, h = h, w
+        # Rotate points to match
+        box_pts = np.array([box_pts[1], box_pts[2], box_pts[3], box_pts[0]], dtype=np.float32)
+
+    dst_pts = np.array([
+        [0,     0],
+        [w - 1, 0],
+        [w - 1, h - 1],
+        [0,     h - 1]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(box_pts, dst_pts)
+    warped = cv2.warpPerspective(frame_rgb, M, (w, h),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+    return warped
+
+
+def _order_points(pts):
+    """Order 4 points as: top-left, top-right, bottom-right, bottom-left."""
+    # Sort by Y first to get top pair and bottom pair
+    sorted_by_y = pts[np.argsort(pts[:, 1])]
+    top_pair = sorted_by_y[:2]
+    bot_pair = sorted_by_y[2:]
+
+    # Within each pair, sort by X
+    top_pair = top_pair[np.argsort(top_pair[:, 0])]
+    bot_pair = bot_pair[np.argsort(bot_pair[:, 0])]
+
+    return np.array([top_pair[0], top_pair[1], bot_pair[1], bot_pair[0]], dtype=np.float32)
+
+
+def save_rgb_image(rgb_array, path):
+    """Save an RGB numpy array as a JPEG using PIL — guaranteed RGB output."""
+    img = Image.fromarray(rgb_array.astype(np.uint8), 'RGB')
+    img.save(path, 'JPEG', quality=95)
+    print(f"  [SAVE] RGB image → {path}")
+
+
+def smooth_bbox(prev, curr, alpha=0.50):
     """Exponential smoothing to suppress bbox jitter."""
     if prev is None:
         return curr
     return tuple(int(alpha*c + (1-alpha)*p) for p, c in zip(prev, curr))
-
-
-def in_edge_zone(bbox, fshape):
-    """True if bbox centre is in the outer EDGE_FRAC of the frame."""
-    x, y, bw, bh = bbox
-    fh, fw = fshape[:2]
-    cx, cy = x + bw // 2, y + bh // 2
-    ez = EDGE_FRAC
-    return cx < fw*ez or cx > fw*(1-ez) or cy < fh*ez or cy > fh*(1-ez)
-
-
-def fully_centred(bbox, fshape):
-    """True if bounding box is fully inside the centre margin."""
-    x, y, bw, bh = bbox
-    fh, fw = fshape[:2]
-    m = CENTRE_MARGIN
-    return x > m and y > m and x+bw < fw-m and y+bh < fh-m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,9 +415,9 @@ def fully_centred(bbox, fshape):
 # ─────────────────────────────────────────────────────────────────────────────
 scan_state = {
     "running":          False,
-    "motor":            "STOPPED",
-    "camera":           "OFF",
-    "phase":            "IDLE",
+    "motor":            "STOPPED",   # "SPINNING" | "STOPPED"
+    "camera":           "OFF",       # "LIVE" | "OFF"
+    "phase":            "IDLE",      # "IDLE" | "SCANNING" | "CAPTURING" | etc.
     "captures":         0,
     "last_score":       0.0,
     "last_capture_path": None,
@@ -567,16 +427,54 @@ scan_state = {
 }
 _scan_lock = threading.Lock()
 _scan_thread = None
-session_captures = []
+session_captures = []   # list of dicts: {name, annotated_name}
+
+
+def _detect_strip(frame_rgb):
+    """
+    Detect the saliva strip in a frame.
+    Uses Edge Impulse model if available, otherwise falls back to colour mask.
+
+    Returns: (bbox, score, contour) — same interface as find_component()
+    """
+    if analyzer.runner is not None:
+        try:
+            # Model expects RGB — our frames are already RGB
+            features, _ = analyzer.runner.get_features_from_image(frame_rgb)
+            res = analyzer.runner.classify(features)
+            bboxes = res.get('result', {}).get('bounding_boxes', [])
+
+            best_bb = None
+            best_conf = 0.0
+            for bb in bboxes:
+                conf = bb.get('confidence', 0)
+                if conf > best_conf:
+                    best_conf = conf
+                    best_bb = bb
+
+            if best_bb is not None and best_conf >= analyzer.confidence:
+                x, y, w, h = best_bb['x'], best_bb['y'], best_bb['width'], best_bb['height']
+                # Return in same format as find_component: (x, y, w, h), score, None
+                # (contour is None — model gives bbox directly)
+                return (x, y, w, h), best_conf, None
+            else:
+                return None, 0.0, None
+        except Exception as e:
+            print(f"[EI SCAN] Model inference failed: {e} — falling back to colour mask")
+
+    # Fallback: colour-based detection
+    return find_component(frame_rgb)
 
 
 def _scan_loop():
     """
-    Background thread: motor + detection loop.
-    - Searches for object, calculates score average over 5 seconds
-    - If average score >= 0.5, captures
-    - Otherwise, continues rotating
-    - Motor decelerates as object enters frame
+    Background thread: motor + detection loop with 5-second averaging.
+
+    1. Motor rotates slowly (constant speed)
+    2. Detect strip using Edge Impulse model (or colour mask fallback)
+    3. Collect detection scores for 5 seconds
+    4. If average score > 0.5 → STOP motor, capture
+    5. Else → keep rotating, start new 5-second window
     """
     global scan_state, _cam
 
@@ -584,12 +482,12 @@ def _scan_loop():
         scan_state["phase"] = "SCANNING"
         scan_state["motor"] = "SPINNING"
 
-    motor_go(STEP_FAST)
-    smooth_box      = None
-    wait_for_gone   = False
-    score_buffer    = []  # Track scores over 5 seconds
-    buffer_start    = time.time()
-    BUFFER_WINDOW   = 5.0  # seconds
+    motor_go()
+    smooth_box     = None
+    last_contour   = None
+    wait_for_gone  = False
+    AVG_WINDOW     = 5.0   # seconds to average over
+    AVG_THRESHOLD  = 0.5   # minimum average score to trigger capture
 
     while True:
         with _scan_lock:
@@ -597,6 +495,7 @@ def _scan_loop():
                 break
             total_captures = scan_state["captures"]
 
+        # ── Session limit ────────────────────────────────────────────────────
         if total_captures >= MAX_CAPTURES:
             with _scan_lock:
                 scan_state["phase"] = "DONE"
@@ -610,22 +509,18 @@ def _scan_loop():
             time.sleep(0.05)
             continue
 
-        bbox, score = find_component(frame)
-        now = time.time()
-
-        # Clear old scores outside the 5-second window
-        score_buffer = [s for s in score_buffer if now - s['time'] < BUFFER_WINDOW]
+        bbox, score, contour = _detect_strip(frame)
 
         with _scan_lock:
             scan_state["last_score"] = round(score, 3)
 
+        # ── Wait for object to leave after a capture ─────────────────────────
         if wait_for_gone:
             if bbox is None or score < CONFIDENCE_THRESHOLD:
                 wait_for_gone = False
-                score_buffer = []
-                buffer_start = time.time()
-                smooth_box   = None
-                motor_go(STEP_FAST)
+                smooth_box    = None
+                last_contour  = None
+                motor_go()
                 with _scan_lock:
                     scan_state["phase"] = "SCANNING"
                     scan_state["motor"] = "SPINNING"
@@ -636,144 +531,188 @@ def _scan_loop():
             time.sleep(0.02)
             continue
 
-        if bbox is not None and score >= CONFIDENCE_THRESHOLD:
-            # Add score to buffer
-            score_buffer.append({'score': score, 'time': now, 'bbox': bbox})
+        # ── 5-second averaging window ────────────────────────────────────────
+        window_start = time.time()
+        scores_in_window = []
+        best_contour = None
+        best_bbox    = None
+        best_score   = 0.0
 
-            # Calculate average score
-            if score_buffer:
-                avg_score = sum(s['score'] for s in score_buffer) / len(score_buffer)
-                frame_count = len(score_buffer)
-            else:
-                avg_score = 0.0
-                frame_count = 0
-
-            smooth_box = smooth_bbox(smooth_box, bbox)
-            centred    = fully_centred(smooth_box, frame.shape)
-            edge       = in_edge_zone(smooth_box, frame.shape)
-
-            # Update phase with average score info
+        while True:
             with _scan_lock:
-                scan_state["phase"]         = f"ANALYZING ({frame_count} frames)"
-                scan_state["last_score"]    = round(avg_score, 3)
-                scan_state["confirm_count"] = frame_count
+                if not scan_state["running"]:
+                    break
+                total_captures = scan_state["captures"]
 
-            # Adjust motor speed based on position
-            if not centred:
-                motor_speed(STEP_SLOW if edge else STEP_CRAWL)
+            if total_captures >= MAX_CAPTURES:
+                break
+
+            elapsed = time.time() - window_start
+            if elapsed >= AVG_WINDOW:
+                break
+
+            frame = grab_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            bbox, score, contour = _detect_strip(frame)
+            scores_in_window.append(score)
+
+            with _scan_lock:
+                scan_state["last_score"] = round(score, 3)
+
+            # Track best detection in this window for capture
+            if score > best_score and bbox is not None:
+                best_score   = score
+                best_contour = contour   # None when using model, that's OK
+                best_bbox    = bbox
+
+            if bbox is not None and score >= CONFIDENCE_THRESHOLD:
+                smooth_box = smooth_bbox(smooth_box, bbox)
+                last_contour = contour
+                with _scan_lock:
+                    scan_state["phase"] = "LOCKED"
             else:
-                motor_speed(STEP_CRAWL)
+                with _scan_lock:
+                    scan_state["phase"] = "SEARCHING"
 
-            # Check if we've been analyzing for 5 seconds
-            elapsed = now - buffer_start
-            if elapsed >= BUFFER_WINDOW and score_buffer:
-                avg_score = sum(s['score'] for s in score_buffer) / len(score_buffer)
-                
-                print(f"[ANALYSIS] 5-second window complete:")
-                print(f"  Frames: {len(score_buffer)}")
-                print(f"  Average score: {avg_score:.3f}")
-                print(f"  Threshold: {0.5}")
+            time.sleep(0.05)  # ~20 fps
 
-                if avg_score >= 0.5:
-                    # CAPTURE
-                    motor_stop()
-                    with _scan_lock:
-                        scan_state["phase"] = "CAPTURING"
-                        scan_state["motor"] = "STOPPED"
+        # ── Evaluate 5-second average ───────────────────────────────────────
+        if not scores_in_window:
+            continue
 
-                    time.sleep(SETTLE_TIME)
+        avg_score = sum(scores_in_window) / len(scores_in_window)
+        print(f"[AVG] {len(scores_in_window)} frames in 5s, avg_score={avg_score:.3f}")
 
-                    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    photo_name = f"smd_{timestamp}.jpg"
-                    photo_path = os.path.join(OUTPUT_DIR, photo_name)
+        with _scan_lock:
+            if not scan_state["running"]:
+                break
+            total_captures = scan_state["captures"]
+        if total_captures >= MAX_CAPTURES:
+            with _scan_lock:
+                scan_state["phase"] = "DONE"
+                scan_state["motor"] = "STOPPED"
+            motor_stop()
+            break
 
-                    frame2 = grab_frame()
-                    if frame2 is not None:
-                        x, y, bw, bh = [int(v) for v in smooth_box]
-                        fh, fw = frame2.shape[:2]
-                        pad_x = int(bw * 0.10)
-                        pad_y = int(bh * 0.10)
-                        x1 = max(0,  x - pad_x)
-                        y1 = max(0,  y - pad_y)
-                        x2 = min(fw, x + bw + pad_x)
-                        y2 = min(fh, y + bh + pad_y)
-                        crop = frame2[y1:y2, x1:x2]
-                        if crop.size > 0:
-                            cv2.imwrite(photo_path, crop)
-                        else:
-                            cv2.imwrite(photo_path, frame2)
-                            crop = frame2
+        if avg_score >= AVG_THRESHOLD and best_bbox is not None:
+            # ══════════════════════════════════════════════════════════════
+            #  STOP → WAIT → CAPTURE → RESUME
+            # ══════════════════════════════════════════════════════════════
+            motor_stop()
+            with _scan_lock:
+                scan_state["phase"] = "CAPTURING"
+                scan_state["motor"] = "STOPPED"
 
-                        annotated_name = photo_name.replace('.jpg', '_annotated.jpg')
-                        annotated_path = os.path.join(OUTPUT_DIR, annotated_name)
-                        ann = crop.copy()
-                        ax  = x - x1
-                        ay  = y - y1
-                        abw, abh = bw, bh
-                        col = (0, 220, 80)
-                        dk  = (20, 20, 20)
-                        L   = min(abw, abh) // 5
-                        FONT_ANN = cv2.FONT_HERSHEY_SIMPLEX
-                        for pts in [
-                            ((ax,       ay+L),     (ax,       ay),     (ax+L,     ay)),
-                            ((ax+abw-L, ay),       (ax+abw,   ay),     (ax+abw,   ay+L)),
-                            ((ax+abw,   ay+abh-L), (ax+abw,   ay+abh), (ax+abw-L, ay+abh)),
-                            ((ax+L,     ay+abh),   (ax,       ay+abh), (ax,       ay+abh-L)),
-                        ]:
-                            cv2.polylines(ann, [np.array(pts, np.int32)], False, col, 3, cv2.LINE_AA)
-                        lbl = f"3.0x2.8cm  score:{avg_score:.2f}"
-                        (tw, th), _ = cv2.getTextSize(lbl, FONT_ANN, 0.55, 2)
-                        cv2.rectangle(ann, (ax, ay-th-14), (ax+tw+10, ay), col, -1)
-                        cv2.putText(ann, lbl, (ax+5, ay-6), FONT_ANN, 0.55, dk, 2, cv2.LINE_AA)
-                        cv2.imwrite(annotated_path, ann)
+            print(f"[CAPTURE] Avg score {avg_score:.3f} >= {AVG_THRESHOLD}. Waiting {SETTLE_TIME}s ...")
+            time.sleep(SETTLE_TIME)
 
-                        with _scan_lock:
-                            scan_state["captures"]          += 1
-                            scan_state["last_capture_path"]  = photo_path
-                            scan_state["last_capture_url"]   = f"/capture-image/{photo_name}"
-                            total_captures                   = scan_state["captures"]
-                            session_captures.append({
-                                "name":           photo_name,
-                                "annotated_name": annotated_name,
-                            })
+            # Grab a fresh, settled frame
+            frame2 = grab_frame()
+            if frame2 is None:
+                frame2 = frame  # fallback
 
-                        print(f"[✓] {photo_path}  ({total_captures}/{MAX_CAPTURES})")
-                        print(f"[✓] Annotated: {annotated_path}")
+            # Re-detect on the settled frame for best alignment
+            bbox2, score2, contour2 = _detect_strip(frame2)
 
-                    time.sleep(COOLDOWN_SEC)
-                    motor_go(STEP_FAST)
-                    wait_for_gone = True
-                    score_buffer = []
-                    buffer_start = time.time()
-                    smooth_box   = None
-                    with _scan_lock:
-                        scan_state["confirm_count"] = 0
-                        scan_state["phase"]         = "WAIT_GONE"
-                        scan_state["motor"]         = "SPINNING"
+            use_frame = frame2
+            use_bbox  = bbox2 if bbox2 is not None else best_bbox
+            use_contour = contour2 if contour2 is not None else best_contour
 
+            # Try perspective-correct crop (needs contour)
+            cropped = None
+            if use_contour is not None:
+                cropped = crop_and_align(use_frame, use_contour)
+
+            timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            photo_name = f"smd_{timestamp}.jpg"
+            photo_path = os.path.join(OUTPUT_DIR, photo_name)
+
+            if cropped is not None and cropped.size > 0:
+                save_rgb_image(cropped, photo_path)
+            else:
+                # Fallback: save the bbox crop (still RGB)
+                use_bbox = best_bbox if best_bbox is not None else smooth_box
+                if use_bbox is not None:
+                    x, y, bw, bh = [int(v) for v in use_bbox]
+                    fh, fw = use_frame.shape[:2]
+                    pad_x = int(bw * 0.05)
+                    pad_y = int(bh * 0.05)
+                    x1 = max(0,  x - pad_x)
+                    y1 = max(0,  y - pad_y)
+                    x2 = min(fw, x + bw + pad_x)
+                    y2 = min(fh, y + bh + pad_y)
+                    fallback_crop = use_frame[y1:y2, x1:x2]
+                    if fallback_crop.size > 0:
+                        save_rgb_image(fallback_crop, photo_path)
+                    else:
+                        save_rgb_image(use_frame, photo_path)
                 else:
-                    # Average score too low — continue rotating
-                    print(f"[INFO] Average score {avg_score:.3f} below threshold 0.5 — continuing rotation")
-                    score_buffer = []
-                    buffer_start = time.time()
-                    smooth_box   = None
-                    motor_go(STEP_FAST)
-                    with _scan_lock:
-                        scan_state["phase"]         = "SEARCHING"
-                        scan_state["confirm_count"] = 0
+                    save_rgb_image(use_frame, photo_path)
+
+            # ── Annotated copy with bounding box overlay ──────────────
+            annotated_name = photo_name.replace('.jpg', '_annotated.jpg')
+            annotated_path = os.path.join(OUTPUT_DIR, annotated_name)
+            ann_source = cropped if (cropped is not None and cropped.size > 0) else use_frame
+            ann = ann_source.copy()
+            ah, aw = ann.shape[:2]
+            border = 4
+
+            # 👉 RGB → BGR for OpenCV drawing
+            ann = cv2.cvtColor(ann, cv2.COLOR_RGB2BGR)
+
+            cv2.rectangle(ann, (border, border), (aw - border, ah - border),
+                          (0, 220, 80), 3)
+
+            FONT_ANN = cv2.FONT_HERSHEY_SIMPLEX
+            lbl = f"avg:{avg_score:.2f}  best:{best_score:.2f}"
+
+            (tw, th), _ = cv2.getTextSize(lbl, FONT_ANN, 0.55, 2)
+
+            cv2.rectangle(ann, (border, border), (border + tw + 10, border + th + 14),
+                          (0, 220, 80), -1)
+
+            cv2.putText(ann, lbl, (border + 5, border + th + 6),
+                        FONT_ANN, 0.55, (20, 20, 20), 2, cv2.LINE_AA)
+
+            # 👉 BGR → RGB before saving
+            ann = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
+
+            save_rgb_image(ann, annotated_path)
+            with _scan_lock:
+                scan_state["captures"]          += 1
+                scan_state["last_capture_path"]  = photo_path
+                scan_state["last_capture_url"]   = f"/capture-image/{photo_name}"
+                total_captures                   = scan_state["captures"]
+                session_captures.append({
+                    "name":           photo_name,
+                    "annotated_name": annotated_name,
+                })
+
+            print(f"[✓] {photo_path}  ({total_captures}/{MAX_CAPTURES})")
+
+            # Resume motor and wait for object to clear
+            time.sleep(COOLDOWN_SEC)
+            motor_go()
+            wait_for_gone = True
+            smooth_box    = None
+            last_contour  = None
+            with _scan_lock:
+                scan_state["confirm_count"] = 0
+                scan_state["phase"]         = "WAIT_GONE"
+                scan_state["motor"]         = "SPINNING"
 
         else:
-            # No object detected — reset buffer
-            score_buffer = []
-            buffer_start = time.time()
+            # Average too low — keep rotating, start new window
+            print(f"[SKIP] Avg score {avg_score:.3f} < {AVG_THRESHOLD} — keep rotating")
             smooth_box   = None
-            motor_speed(STEP_FAST)
+            last_contour = None
             with _scan_lock:
-                scan_state["phase"]         = "SEARCHING"
-                scan_state["confirm_count"] = 0
+                scan_state["phase"] = "SCANNING"
 
-        time.sleep(0.02)
-
+    # Cleanup on exit
     motor_stop()
     with _scan_lock:
         scan_state["phase"] = "IDLE"
@@ -781,47 +720,63 @@ def _scan_loop():
         scan_state["confirm_count"] = 0
     print("[SCAN] Loop exited.")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  MJPEG STREAM GENERATOR
+#  MJPEG STREAM GENERATOR  — frames are RGB, encode via PIL (no BGR)
 # ─────────────────────────────────────────────────────────────────────────────
 def _gen_mjpeg():
     """Yields MJPEG frames for the /stream endpoint."""
     while True:
         frame = grab_frame()
         if frame is None:
+            # Send a placeholder grey frame
             placeholder = np.full((240, 320, 3), 40, dtype=np.uint8)
             cv2.putText(placeholder, "Camera not available",
                         (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-            _, buf = cv2.imencode('.jpg', placeholder)
+            img = Image.fromarray(placeholder)
+            buf_io = io.BytesIO()
+            img.save(buf_io, format='JPEG', quality=70)
+            buf = buf_io.getvalue()
         else:
+            # Draw detection overlay
             with _scan_lock:
                 phase = scan_state["phase"]
                 score = scan_state["last_score"]
+            
             display = cv2.resize(frame, (640, 480))
-            color = (0, 220, 80) if phase == "CAPTURING" else (0, 165, 255)
+# 👉 RGB → BGR for OpenCV drawing
+            display = cv2.cvtColor(display, cv2.COLOR_RGB2BGR)
+            color = (80, 220, 0) if phase == "CAPTURING" else (255, 165, 0)
             label = f"{phase}  score:{score:.2f}"
             cv2.putText(display, label, (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            _, buf = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+# 👉 Convert back to RGB before encoding
+            display = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(display)
+            buf_io = io.BytesIO()
+            img.save(buf_io, format='JPEG', quality=70)
+            buf = buf_io.getvalue()
 
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        time.sleep(0.05)
+               b'Content-Type: image/jpeg\r\n\r\n' + buf + b'\r\n')
+        time.sleep(0.05)   # ~20 fps cap
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FLASK APP
 # ─────────────────────────────────────────────────────────────────────────────
+from strip_analysis_simple import SimpleSalivaStripAnalyzer
+
 app = Flask(__name__, static_folder='.')
 CORS(app)
 
-# ── Load Edge Impulse model once at startup ──
-print("Loading Edge Impulse model...")
-_load_ei_model()
-if _ei_runner is not None:
-    print("✓ Edge Impulse model ready!\n")
-else:
-    print("⚠ Edge Impulse model failed to load — analysis endpoints will return errors.\n")
+# ── Load Edge Impulse model once ──
+print("Loading Edge Impulse model (modalv2.eim)...")
+analyzer = SimpleSalivaStripAnalyzer(
+    model_path='modalv2.eim',
+    confidence=0.5
+)
+print("✓ Model ready!\n")
 
 
 # ── Serve dashboard ──
@@ -837,7 +792,7 @@ def serve_capture(filename):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ANALYSIS ENDPOINT  — now uses Edge Impulse model
+#  EXISTING ANALYSIS ENDPOINT (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -850,9 +805,6 @@ def analyze():
     if not files or files[0].filename == '':
         return jsonify({'error': 'Empty filename'}), 400
 
-    if _ei_runner is None:
-        return jsonify({'error': 'Edge Impulse model not loaded'}), 500
-
     all_results = []
     try:
         for file in files:
@@ -864,10 +816,9 @@ def analyze():
                 tmp_path = tmp.name
 
             try:
-                detections = run_ei_inference(tmp_path)
-                if detections is None:
+                results = analyzer.analyze(tmp_path)
+                if results is None:
                     continue
-                results = ei_detections_to_results(detections, tmp_path)
                 all_results.append(_format_results(file.filename, results))
             finally:
                 if os.path.exists(tmp_path):
@@ -889,13 +840,20 @@ def analyze():
 
 @app.route('/calibrate', methods=['POST'])
 def calibrate():
+    """
+    1. Open camera (if not already open)
+    2. Spin motor for 0.5 s then stop
+    3. Return OK or error
+    """
     global _cam
+
     errors = []
 
+    # Camera
     cam_ok = False
     try:
         if _cam is None:
-            _cam = open_camera()
+            _cam = open_camera()   # blocking setup
         cam_ok = (_cam is not None)
     except Exception:
         pass
@@ -906,6 +864,7 @@ def calibrate():
     with _scan_lock:
         scan_state["camera"] = "LIVE" if cam_ok else "OFF"
 
+    # Motor calibration spin
     motor_ok = _gpio_ok
     if not motor_ok:
         errors.append("GPIO not available on this platform")
@@ -929,13 +888,14 @@ def calibrate():
 
 @app.route('/start-scan', methods=['POST'])
 def start_scan():
-    """Start the SMD detection loop in a background thread."""
+    """Start the strip detection loop in a background thread."""
     global _scan_thread, _cam
 
     with _scan_lock:
         if scan_state["running"]:
             return jsonify({"success": False, "error": "Already scanning"}), 400
 
+    # Ensure camera is open
     if _cam is None:
         _cam = open_camera()
     with _scan_lock:
@@ -948,7 +908,7 @@ def start_scan():
         scan_state["confirm_count"] = 0
         scan_state["captures"]      = 0
         global session_captures
-        session_captures = []
+        session_captures = []   # reset to empty list of dicts
 
     _scan_thread = threading.Thread(target=_scan_loop, daemon=True)
     _scan_thread.start()
@@ -958,7 +918,7 @@ def start_scan():
 
 @app.route('/stop-scan', methods=['POST'])
 def stop_scan():
-    """Stop the SMD detection loop."""
+    """Stop the strip detection loop."""
     with _scan_lock:
         scan_state["running"] = False
         scan_state["phase"]   = "IDLE"
@@ -970,14 +930,9 @@ def stop_scan():
 def shutdown():
     """Cleanly stop everything and terminate the Flask process."""
     def _do_exit():
-        time.sleep(0.4)
+        time.sleep(0.4)   # allow the HTTP response to be sent first
         motor_stop()
         release_camera()
-        if _ei_runner is not None:
-            try:
-                _ei_runner.stop()
-            except Exception:
-                pass
         print("[APP] Shutdown requested — bye.")
         os._exit(0)
 
@@ -1010,7 +965,7 @@ def captures():
     """Returns list of captured image filenames from the current session."""
     try:
         global session_captures
-        files = list(reversed(session_captures))
+        files = list(reversed(session_captures))  # Newest first
         return jsonify({
             "success": True,
             "count":   len(files),
@@ -1028,23 +983,20 @@ def captures():
 def analyze_captures():
     """Run Edge Impulse analysis on multiple captured images by filename."""
     data = request.get_json(silent=True) or {}
-    filenames = data.get('filenames', [])
-    ann_map   = data.get('annotated_map', {})
+    filenames = data.get('filenames', [])        # plain names
+    ann_map   = data.get('annotated_map', {})   # plain_name -> annotated_name
     if not filenames:
         return jsonify({'error': 'No filenames provided'}), 400
-
-    if _ei_runner is None:
-        return jsonify({'error': 'Edge Impulse model not loaded'}), 500
 
     all_results = []
     for filename in filenames:
         path = os.path.join(OUTPUT_DIR, os.path.basename(filename))
         if os.path.exists(path):
             try:
-                detections = run_ei_inference(path)
-                if detections is not None:
-                    results  = ei_detections_to_results(detections, path)
+                results = analyzer.analyze(path)
+                if results is not None:
                     response = _format_results(filename, results)
+                    # Attach annotated image URL
                     ann_name = ann_map.get(filename, filename.replace('.jpg', '_annotated.jpg'))
                     if os.path.exists(os.path.join(OUTPUT_DIR, ann_name)):
                         response['annotated_url'] = f'/capture-image/{ann_name}'
@@ -1054,7 +1006,7 @@ def analyze_captures():
 
     if not all_results:
         return jsonify({'error': 'Could not analyze any images'}), 500
-
+        
     return jsonify({'success': True, 'results': all_results})
 
 
@@ -1062,8 +1014,8 @@ def analyze_captures():
 def analyze_capture():
     """Run Edge Impulse analysis on a single captured image by filename."""
     data = request.get_json(silent=True) or {}
-    filename       = data.get('filename', '')
-    annotated_name = data.get('annotated_name', '')
+    filename         = data.get('filename', '')
+    annotated_name   = data.get('annotated_name', '')
     if not filename:
         return jsonify({'error': 'No filename provided'}), 400
 
@@ -1071,15 +1023,12 @@ def analyze_capture():
     if not os.path.exists(path):
         return jsonify({'error': f'File not found: {filename}'}), 404
 
-    if _ei_runner is None:
-        return jsonify({'error': 'Edge Impulse model not loaded'}), 500
-
     try:
-        detections = run_ei_inference(path)
-        if detections is None:
+        results = analyzer.analyze(path)
+        if results is None:
             return jsonify({'error': 'Could not analyze image'}), 500
-        results  = ei_detections_to_results(detections, path)
         response = _format_results(filename, results)
+        # Attach annotated image URL when available
         if annotated_name:
             response['annotated_url'] = f'/capture-image/{os.path.basename(annotated_name)}'
         elif os.path.exists(os.path.join(OUTPUT_DIR, filename.replace('.jpg', '_annotated.jpg'))):
@@ -1093,17 +1042,16 @@ def analyze_capture():
 @app.route('/health')
 def health():
     return jsonify({
-        'status':       'ok',
-        'model':        'edge_impulse' if _ei_runner is not None else 'not_loaded',
-        'model_path':   EIM_MODEL_PATH,
-        'gpio':         _gpio_ok,
-        'camera':       USE_PICAMERA,
+        'status': 'ok',
+        'model':  'loaded',
+        'gpio':   _gpio_ok,
+        'camera': USE_PICAMERA,
         'captures_dir': OUTPUT_DIR,
     })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SHARED RESULT FORMATTER  (unchanged — same output shape as before)
+#  SHARED RESULT FORMATTER
 # ─────────────────────────────────────────────────────────────────────────────
 def _format_results(filename, results):
     cancer     = results['cancer_risk']
@@ -1169,10 +1117,10 @@ def _format_results(filename, results):
 
 if __name__ == '__main__':
     print("=" * 52)
-    print("  OralScan + SMD Scanner Backend running!")
+    print("  OralScan + Strip Scanner Backend running!")
+    print("  *** ALL FRAMES ARE RGB — NO BGR ***")
     print("  Open: http://localhost:5000")
     print("  GPIO  available:", _gpio_ok)
     print("  Camera available:", USE_PICAMERA)
-    print("  EI model loaded:", _ei_runner is not None)
     print("=" * 52 + "\n")
     app.run(debug=False, port=5000, threaded=True)
