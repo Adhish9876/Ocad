@@ -1,8 +1,5 @@
 """
 Flask Backend for OralScan Dashboard
-
-leodasss
-
 """
 
 from flask import Flask, request, jsonify, send_from_directory, Response
