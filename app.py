@@ -1,18 +1,8 @@
 """
 Flask Backend for OralScan Dashboard
-=====================================
-Connects strip_analysis.py to the HTML dashboard.
-Also drives PiCamera2 + ULN2003 stepper motor for Raspberry Pi 5 deployment.
 
-*** ALL FRAMES ARE RGB — NO BGR ANYWHERE IN THE PIPELINE ***
+leodasss
 
-Install dependencies (Pi):
-    pip install flask flask-cors picamera2 RPi.GPIO opencv-python-headless numpy ultralytics Pillow
-
-Run:
-    python app.py
-
-Then open: http://localhost:5000
 """
 
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -31,7 +21,7 @@ from PIL import Image
 # ─────────────────────────────────────────────────────────────────────────────
 USE_STEPPER   = True
 MOTOR_PINS    = [17, 18, 27, 22]   # IN1..IN4 → BCM GPIO
-MOTOR_DELAY   = 0.008              # single slow speed (seconds per half-step)
+MOTOR_DELAY   = 0.008              # slower stepping for smoother, low-vibration spin
 
 HALF_STEP_SEQ = [
     [1, 0, 0, 0],
@@ -56,7 +46,7 @@ if USE_STEPPER:
         for pin in MOTOR_PINS:
             _motor_devices.append(DigitalOutputDevice(pin, initial_value=False))
         _gpio_ok = True
-        print("[GPIO] Stepper motor pins initialised via gpiozero.")
+        pass  # GPIO ready
     except Exception as e:
         print(f"[WARN] GPIO init failed ({e}) — motor disabled (OK on non-Pi).")
 
@@ -74,6 +64,7 @@ import cv2
 import numpy as np
 
 PREVIEW_W, PREVIEW_H = 1640, 1232   # Half-sensor resolution — faster streaming
+PICAMERA_OUTPUT_IS_BGR = os.getenv("PICAMERA_OUTPUT_IS_BGR", "1").lower() in ("1", "true", "yes", "on")
 
 OUTPUT_DIR = os.path.expanduser("~/smd_captures")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -120,7 +111,7 @@ def motor_go():
     _ensure_motor_thread()
     with _motor_lock:
         _motor_running = True
-    print(f"[MOTOR] ON  (delay={MOTOR_DELAY*1000:.0f}ms/half-step)")
+    pass  # motor on
 
 
 def motor_stop():
@@ -131,7 +122,7 @@ def motor_stop():
     if _gpio_ok:
         for dev in _motor_devices:
             dev.off()
-    print("[MOTOR] OFF")
+    pass  # motor off
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,8 +144,16 @@ def _cam_worker():
                 continue
             try:
                 if USE_PICAMERA:
-                    # PiCamera2 with RGB888 → already RGB, NO conversion
+                    # Some PiCamera setups still deliver BGR even in RGB888 mode.
+                    # Normalize once here so downstream always sees RGB.
                     f = _cam.capture_array()
+                    if (
+                        f is not None
+                        and len(f.shape) == 3
+                        and f.shape[2] == 3
+                        and PICAMERA_OUTPUT_IS_BGR
+                    ):
+                        f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
                 else:
                     # OpenCV webcam gives BGR → convert to RGB
                     ok, bgr = _cam.read()
@@ -235,92 +234,127 @@ def release_camera():
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_CAPTURES = 10
 
-# Aspect ratio: width / height  (2.8 cm wide, 3.0 cm tall → 0.933)
-TARGET_ASPECT    = 2.8 / 3.0
-ASPECT_TOL       = 0.40      # accepts 0.53 … 1.33 (generous for tilt/perspective)
+# Aspect ratio: width / height  (3.0 cm wide, 3.0 cm tall → 1.0)
+TARGET_ASPECT    = 1.0
+ASPECT_TOL       = 0.25      # accepts 0.75 … 1.25 (selective for square shape)
 
-MIN_FILL = 0.015   # ~1.5%
-MAX_FILL = 0.85
+MIN_FILL = 0.10    # raised from 0.015 — 3cm x 3cm should fill at least 10% of frame
+MAX_FILL = 0.95    # card can fill >85% at 3-4 cm distance
 
-MIN_RECT_SCORE       = 0.50
+MIN_RECT_SCORE       = 0.65  # ensure it's fairly rectangular
 CONFIDENCE_THRESHOLD = 0.30
-CONFIRM_FRAMES       = 3
-SETTLE_TIME          = 1.5    # wait 1.5s after motor stop before capture
+CAPTURE_TRIGGER_SCORE = 0.85
+TRIGGER_FRAMES_REQUIRED = 1
+VERIFY_WAIT_SEC      = 1.0
+SETTLE_TIME          = 2    # wait 1.5s after motor stop before capture
 COOLDOWN_SEC         = 0.5    # short pause after capture before resuming motor
+POST_CAPTURE_LOCKOUT_SEC = 3.0
+CENTER_MARGIN_FRAC   = 0.16
+
+# Shared detection bbox for MJPEG overlay (written by scan loop, read by stream)
+_det_bbox  = None
+_det_lock  = threading.Lock()
 
 
 def find_component(frame_rgb):
     """
-    Detect the white strip on a red background using colour masking.
+    Detect the strip card by finding the NON-RED region on a red background.
 
-    Input : RGB frame (numpy array)
+    Instead of detecting white (which fragments because the strip has colored
+    biomarker circles), we detect the red platform and invert the mask.
+    The largest non-red blob is the full strip card.
+
+    Input : RGB frame
     Output: (bbox, score, contour) or (None, 0, None)
-
-    Pipeline:
-    1. Downscale 2× for speed
-    2. RGB → HSV
-    3. White mask: low Saturation (0-60), high Value (160-255)
-    4. Morphological close + dilate to fill holes
-    5. Find contours → filter by fill, aspect ratio, rectangularity
-    6. Return best match with its contour (needed for perspective crop)
     """
+    global _det_bbox
     fh, fw = frame_rgb.shape[:2]
     small = cv2.resize(frame_rgb, (fw // 2, fh // 2))
     sh, sw = small.shape[:2]
-    s_area = sh * sw
 
-    # RGB → HSV (OpenCV's cvtColor with COLOR_RGB2HSV works on RGB input)
+    # RGB → HSV
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
 
-    # White mask: any hue, low saturation, high value
-    # White objects have S < 60 and V > 160 typically
-    lower_white = np.array([0,   0, 160], dtype=np.uint8)
-    upper_white = np.array([180, 60, 255], dtype=np.uint8)
-    white_mask = cv2.inRange(hsv, lower_white, upper_white)
+    # ── Step 1: Detect the RED background ──
+    # Red hue wraps around 0/180 in OpenCV HSV
+    red_lo1 = cv2.inRange(hsv, np.array([0,   50, 50]),  np.array([10,  255, 255]))
+    red_hi1 = cv2.inRange(hsv, np.array([160, 50, 50]),  np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(red_lo1, red_hi1)
 
-    # Clean up the mask
-    k_close  = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE,  k_close,  iterations=3)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_DILATE, k_dilate, iterations=1)
+    # ── Step 2: Invert → everything that is NOT red = candidate strip ──
+    not_red = cv2.bitwise_not(red_mask)
 
-    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL,
+    # ── Step 3: Also add a white/bright mask to catch overexposed strip areas ──
+    white_mask = cv2.inRange(hsv, np.array([0, 0, 120]), np.array([180, 80, 255]))
+    # Combine: strip = (not red) OR (white/bright)
+    strip_mask = cv2.bitwise_or(not_red, white_mask)
+
+    # ── Step 4: Clean up with aggressive morphology ──
+    # Large kernel fills gaps from channels/circles within the strip
+    k_big = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+    strip_mask = cv2.morphologyEx(strip_mask, cv2.MORPH_CLOSE, k_big, iterations=4)
+    # Erode slightly to remove edge noise from the red background
+    k_sm = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    strip_mask = cv2.morphologyEx(strip_mask, cv2.MORPH_OPEN, k_sm, iterations=2)
+
+    # ── Step 5: Find contours ──
+    contours, _ = cv2.findContours(strip_mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
-    best_bbox, best_score, best_contour = None, 0.0, None
+    if not contours:
+        with _det_lock:
+            _det_bbox = None
+        return None, 0.0, None
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        fill = area / s_area
-        if fill < MIN_FILL or fill > MAX_FILL:
-            continue
+    # Pick the largest contour
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
 
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw == 0 or bh == 0:
-            continue
+    if area < (sh * sw * MIN_FILL):
+        with _det_lock:
+            _det_bbox = None
+        return None, 0.0, None
 
-        aspect = bw / bh
-        if abs(aspect - TARGET_ASPECT) > ASPECT_TOL:
-            continue
+    # Use convex hull to fill any remaining concavities (biomarker circles)
+    hull = cv2.convexHull(largest)
+    x, y, bw, bh = cv2.boundingRect(hull)
 
-        rect_fill = area / (bw * bh)
-        if rect_fill < MIN_RECT_SCORE:
-            continue
+    # ── VALIDATION: Ensure it's roughly 3cm x 3cm (square) ──
+    aspect = bw / bh
+    if abs(aspect - TARGET_ASPECT) > ASPECT_TOL:
+        with _det_lock:
+            _det_bbox = None
+        return None, 0.0, None
 
-        asp_penalty = 1.0 - abs(aspect - TARGET_ASPECT) / ASPECT_TOL
-        score = rect_fill * asp_penalty
+    # Ensure it's rectangular enough (not a circle or random blob)
+    rect_fill = area / (bw * bh)
+    if rect_fill < MIN_RECT_SCORE:
+        with _det_lock:
+            _det_bbox = None
+        return None, 0.0, None
 
-        print(f"  [DET] fill={fill:.4f} asp={aspect:.3f} "
-              f"rect={rect_fill:.2f} score={score:.3f}")
+    # Small padding (5%) to ensure the full edge is captured
+    pad_x = int(bw * 0.05)
+    pad_y = int(bh * 0.05)
+    x = max(0, x - pad_x)
+    y = max(0, y - pad_y)
+    bw = min(sw - x, bw + 2 * pad_x)
+    bh = min(sh - y, bh + 2 * pad_y)
 
-        if score > best_score:
-            best_score   = score
-            best_bbox    = (x * 2, y * 2, bw * 2, bh * 2)   # scale back to full res
-            # Scale contour back to full resolution
-            best_contour = cnt * 2
+    score = 0.85  # Confidence increased for square-validated detection
 
-    return best_bbox, best_score, best_contour
+    # Scale back to full resolution
+    bbox = (x * 2, y * 2, bw * 2, bh * 2)
+    contour_full = hull * 2
 
+    # Share with MJPEG stream for live overlay
+    with _det_lock:
+        _det_bbox = bbox
+
+    print(f"  [DET] bbox=({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}) "
+          f"fill={area/(sh*sw):.3f} asp={aspect:.2f} score={score:.2f}")
+
+    return bbox, score, contour_full
 
 def crop_and_align(frame_rgb, contour):
     """
@@ -393,7 +427,7 @@ def save_rgb_image(rgb_array, path):
     """Save an RGB numpy array as a JPEG using PIL — guaranteed RGB output."""
     img = Image.fromarray(rgb_array.astype(np.uint8), 'RGB')
     img.save(path, 'JPEG', quality=95)
-    print(f"  [SAVE] RGB image → {path}")
+    pass  # saved
 
 
 def smooth_bbox(prev, curr, alpha=0.50):
@@ -401,6 +435,24 @@ def smooth_bbox(prev, curr, alpha=0.50):
     if prev is None:
         return curr
     return tuple(int(alpha*c + (1-alpha)*p) for p, c in zip(prev, curr))
+
+
+def is_center_aligned(bbox, frame_shape):
+    """Require bbox center to stay near frame center."""
+    if bbox is None:
+        return False
+    x, y, bw, bh = [int(v) for v in bbox]
+    fh, fw = frame_shape[:2]
+    if bw <= 0 or bh <= 0 or fw <= 0 or fh <= 0:
+        return False
+
+    cx = x + bw / 2.0
+    cy = y + bh / 2.0
+    min_x = fw * CENTER_MARGIN_FRAC
+    max_x = fw * (1.0 - CENTER_MARGIN_FRAC)
+    min_y = fh * CENTER_MARGIN_FRAC
+    max_y = fh * (1.0 - CENTER_MARGIN_FRAC)
+    return (min_x <= cx <= max_x) and (min_y <= cy <= max_y)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,10 +494,10 @@ def _scan_loop():
         scan_state["motor"] = "SPINNING"
 
     motor_go()
-    confirm_count  = 0
+    trigger_count  = 0
     smooth_box     = None
     last_contour   = None
-    wait_for_gone  = False
+    lockout_until = 0.0
 
     while True:
         with _scan_lock:
@@ -468,143 +520,101 @@ def _scan_loop():
             continue
 
         bbox, score, contour = find_component(frame)
+        now = time.time()
 
         with _scan_lock:
             scan_state["last_score"] = round(score, 3)
 
-        # ── Wait for object to leave after a capture ─────────────────────────
-        if wait_for_gone:
-            if bbox is None or score < CONFIDENCE_THRESHOLD:
-                wait_for_gone = False
-                confirm_count = 0
-                smooth_box    = None
-                last_contour  = None
-                motor_go()
-                with _scan_lock:
-                    scan_state["phase"] = "SCANNING"
-                    scan_state["motor"] = "SPINNING"
-                print("[INFO] Object cleared — re-armed")
-            else:
-                with _scan_lock:
-                    scan_state["phase"] = "WAIT_GONE"
+        # ── Post-capture lockout (slow disk) ─────────────────────────────────
+        if now < lockout_until:
+            with _scan_lock:
+                scan_state["phase"] = "LOCKOUT"
+                scan_state["last_score"] = 0.0
             time.sleep(0.02)
             continue
 
-        # ── Detection ────────────────────────────────────────────────────────
-        if bbox is not None and score >= CONFIDENCE_THRESHOLD:
-            smooth_box = smooth_bbox(smooth_box, bbox)
-            last_contour = contour
-            confirm_count += 1
+        # ── Simple detection rule: Immediate capture on high score ────────────────
+        if bbox is not None and score >= CAPTURE_TRIGGER_SCORE and is_center_aligned(bbox, frame.shape):
+            motor_stop()
+            with _scan_lock:
+                scan_state["phase"] = "CAPTURING"
+                scan_state["motor"] = "STOPPED"
+                scan_state["last_score"] = round(score, 3)
+
+            print(f"[CAPTURE] Score {score:.2f} >= {CAPTURE_TRIGGER_SCORE:.2f}. Stopping and settling...")
+            time.sleep(SETTLE_TIME)
+
+            # Grab fresh high-quality frame after motor settle
+            final_frame = grab_frame()
+            if final_frame is None: final_frame = frame
+            
+            # Re-detect to get final accurate bbox for cropping
+            final_bbox, final_score, final_contour = find_component(final_frame)
+            if final_bbox is None:
+                final_bbox = bbox
+                final_score = score
+            
+            timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            photo_name = f"smd_{timestamp}.jpg"
+            photo_path = os.path.join(OUTPUT_DIR, photo_name)
+            
+            # ── CROP TO BBOX ──
+            bx, by, bw, bh = [int(v) for v in final_bbox]
+            # Add small 5% buffer to crop
+            ih, iw = final_frame.shape[:2]
+            buff_w, buff_h = int(bw * 0.05), int(bh * 0.05)
+            x1, y1 = max(0, bx - buff_w), max(0, by - buff_h)
+            x2, y2 = min(iw, bx + bw + buff_w), min(ih, by + bh + buff_h)
+            
+            cropped_raw = final_frame[y1:y2, x1:x2]
+            save_rgb_image(cropped_raw, photo_path)
+
+            # Create annotated version on the cropped frame
+            annotated_name = photo_name.replace('.jpg', '_annotated.jpg')
+            annotated_path = os.path.join(OUTPUT_DIR, annotated_name)
+            
+            ann = cropped_raw.copy()
+            # Draw bbox (relative to the crop)
+            # Since it's cropped TO the bbox, we just draw at the edge
+            cv2.rectangle(ann, (buff_w, buff_h), (buff_w + bw, buff_h + bh), (0, 220, 80), 3)
+            
+            FONT_ANN = cv2.FONT_HERSHEY_SIMPLEX
+            lbl = f"Score:{final_score:.2f}"
+            (tw, th), _ = cv2.getTextSize(lbl, FONT_ANN, 0.7, 2)
+            cv2.rectangle(ann, (buff_w, buff_h - th - 5), (buff_w + tw + 5, buff_h), (0, 220, 80), -1)
+            cv2.putText(ann, lbl, (buff_w + 2, buff_h - 5),
+                        FONT_ANN, 0.7, (20, 20, 20), 2, cv2.LINE_AA)
+            
+            save_rgb_image(ann, annotated_path)
 
             with _scan_lock:
-                scan_state["phase"]         = "LOCKED"
-                scan_state["confirm_count"] = confirm_count
+                scan_state["captures"]          += 1
+                scan_state["last_capture_path"]  = photo_path
+                scan_state["last_capture_url"]   = f"/capture-image/{photo_name}"
+                total_captures                   = scan_state["captures"]
+                session_captures.append({
+                    "name":           photo_name,
+                    "annotated_name": annotated_name,
+                })
 
-            if confirm_count >= CONFIRM_FRAMES:
-                # ══════════════════════════════════════════════════════════════
-                #  STOP → WAIT → CAPTURE → RESUME
-                # ══════════════════════════════════════════════════════════════
-                motor_stop()
-                with _scan_lock:
-                    scan_state["phase"] = "CAPTURING"
-                    scan_state["motor"] = "STOPPED"
+            print(f"[✓] Saved cropped capture: {photo_name}")
 
-                print(f"[CAPTURE] Motor stopped. Waiting {SETTLE_TIME}s ...")
-                time.sleep(SETTLE_TIME)
-
-                # Grab a fresh, settled frame
-                frame2 = grab_frame()
-                if frame2 is None:
-                    frame2 = frame  # fallback
-
-                # Re-detect on the settled frame for best alignment
-                bbox2, score2, contour2 = find_component(frame2)
-                if contour2 is not None:
-                    use_contour = contour2
-                    use_frame   = frame2
-                else:
-                    use_contour = last_contour
-                    use_frame   = frame2
-
-                # Perspective-correct crop
-                cropped = crop_and_align(use_frame, use_contour)
-
-                timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                photo_name = f"smd_{timestamp}.jpg"
-                photo_path = os.path.join(OUTPUT_DIR, photo_name)
-
-                if cropped is not None and cropped.size > 0:
-                    # Save the clean, perspective-corrected RGB crop
-                    save_rgb_image(cropped, photo_path)
-                else:
-                    # Fallback: save the bbox crop (still RGB)
-                    x, y, bw, bh = [int(v) for v in smooth_box]
-                    fh, fw = use_frame.shape[:2]
-                    pad_x = int(bw * 0.05)
-                    pad_y = int(bh * 0.05)
-                    x1 = max(0,  x - pad_x)
-                    y1 = max(0,  y - pad_y)
-                    x2 = min(fw, x + bw + pad_x)
-                    y2 = min(fh, y + bh + pad_y)
-                    fallback_crop = use_frame[y1:y2, x1:x2]
-                    if fallback_crop.size > 0:
-                        save_rgb_image(fallback_crop, photo_path)
-                    else:
-                        save_rgb_image(use_frame, photo_path)
-
-                # ── Annotated copy with bounding box overlay ──────────────
-                annotated_name = photo_name.replace('.jpg', '_annotated.jpg')
-                annotated_path = os.path.join(OUTPUT_DIR, annotated_name)
-                # Load the saved crop for annotation (already RGB)
-                ann_source = cropped if (cropped is not None and cropped.size > 0) else use_frame
-                ann = ann_source.copy()
-                ah, aw = ann.shape[:2]
-                # Draw a green border to show detection
-                border = 4
-                cv2.rectangle(ann, (border, border), (aw - border, ah - border),
-                              (0, 220, 80), 3)
-                # Label
-                FONT_ANN = cv2.FONT_HERSHEY_SIMPLEX
-                lbl = f"3.0x2.8cm  score:{score:.2f}"
-                (tw, th), _ = cv2.getTextSize(lbl, FONT_ANN, 0.55, 2)
-                cv2.rectangle(ann, (border, border), (border + tw + 10, border + th + 14),
-                              (0, 220, 80), -1)
-                cv2.putText(ann, lbl, (border + 5, border + th + 6),
-                            FONT_ANN, 0.55, (20, 20, 20), 2, cv2.LINE_AA)
-                save_rgb_image(ann, annotated_path)
-
-                with _scan_lock:
-                    scan_state["captures"]          += 1
-                    scan_state["last_capture_path"]  = photo_path
-                    scan_state["last_capture_url"]   = f"/capture-image/{photo_name}"
-                    total_captures                   = scan_state["captures"]
-                    session_captures.append({
-                        "name":           photo_name,
-                        "annotated_name": annotated_name,
-                    })
-
-                print(f"[✓] {photo_path}  ({total_captures}/{MAX_CAPTURES})")
-
-                # Resume motor and wait for object to clear
-                time.sleep(COOLDOWN_SEC)
-                motor_go()
-                wait_for_gone = True
-                confirm_count = 0
-                smooth_box    = None
-                last_contour  = None
-                with _scan_lock:
-                    scan_state["confirm_count"] = 0
-                    scan_state["phase"]         = "WAIT_GONE"
-                    scan_state["motor"]         = "SPINNING"
-
+            time.sleep(COOLDOWN_SEC)
+            motor_go()
+            lockout_until = time.time() + POST_CAPTURE_LOCKOUT_SEC
+            trigger_count = 0
+            smooth_box    = None
+            last_contour  = None
+            with _scan_lock:
+                scan_state["confirm_count"] = 0
+                scan_state["last_score"]    = 0.0
+                scan_state["phase"]         = "LOCKOUT"
+                scan_state["motor"]         = "SPINNING"
         else:
-            confirm_count = max(0, confirm_count - 1)
-            if confirm_count == 0:
-                smooth_box   = None
-                last_contour = None
+            trigger_count = 0
             with _scan_lock:
-                scan_state["phase"]         = "SEARCHING"
-                scan_state["confirm_count"] = confirm_count
+                scan_state["phase"] = "SEARCHING"
+                scan_state["confirm_count"] = 0
 
         time.sleep(0.02)
 
@@ -614,7 +624,7 @@ def _scan_loop():
         scan_state["phase"] = "IDLE"
         scan_state["motor"] = "STOPPED"
         scan_state["confirm_count"] = 0
-    print("[SCAN] Loop exited.")
+    pass  # scan loop exited
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,6 +648,21 @@ def _gen_mjpeg():
             display = cv2.resize(frame, (640, 480))
             # Convert RGB → BGR for the overlay text colours and JPEG encoding
             display_bgr = cv2.cvtColor(display, cv2.COLOR_RGB2BGR)
+
+            # Draw detection bounding box (scaled from full res to 640x480)
+            with _det_lock:
+                det_box = _det_bbox
+            if det_box is not None:
+                fh, fw = frame.shape[:2]
+                sx = 640.0 / fw
+                sy = 480.0 / fh
+                bx = int(det_box[0] * sx)
+                by = int(det_box[1] * sy)
+                bw = int(det_box[2] * sx)
+                bh = int(det_box[3] * sy)
+                box_color = (0, 220, 80) if phase == "CAPTURING" else (0, 255, 0)
+                cv2.rectangle(display_bgr, (bx, by), (bx + bw, by + bh), box_color, 2)
+
             color = (0, 220, 80) if phase == "CAPTURING" else (0, 165, 255)
             label = f"{phase}  score:{score:.2f}"
             cv2.putText(display_bgr, label, (10, 28),
@@ -657,13 +682,11 @@ from strip_analysis_simple import SimpleSalivaStripAnalyzer
 app = Flask(__name__, static_folder='.')
 CORS(app)
 
-# ── Load YOLO model once ──
-print("Loading YOLOv8 model...")
+# ── Load Edge Impulse model once ──
 analyzer = SimpleSalivaStripAnalyzer(
-    model_path='runs/detect/train2/weights/best.pt',
+    model_path='modalv2.eim',
     confidence=0.5
 )
-print("✓ Model ready!\n")
 
 
 # ── Serve dashboard ──
@@ -868,7 +891,7 @@ def captures():
 
 @app.route('/analyze-captures', methods=['POST'])
 def analyze_captures():
-    """Run YOLOv8 analysis on multiple captured images by filename."""
+    """Run Edge Impulse analysis on multiple captured images by filename."""
     data = request.get_json(silent=True) or {}
     filenames = data.get('filenames', [])        # plain names
     ann_map   = data.get('annotated_map', {})   # plain_name -> annotated_name
@@ -880,12 +903,16 @@ def analyze_captures():
         path = os.path.join(OUTPUT_DIR, os.path.basename(filename))
         if os.path.exists(path):
             try:
-                results = analyzer.analyze(path)
+                # Determine annotated path (already has the green box)
+                ann_name = ann_map.get(filename, filename.replace('.jpg', '_annotated.jpg'))
+                ann_path = os.path.join(OUTPUT_DIR, ann_name)
+                
+                # Analyze raw image and DRAW on the annotated one
+                results = analyzer.analyze(path, annotated_path=ann_path)
+                
                 if results is not None:
                     response = _format_results(filename, results)
-                    # Attach annotated image URL
-                    ann_name = ann_map.get(filename, filename.replace('.jpg', '_annotated.jpg'))
-                    if os.path.exists(os.path.join(OUTPUT_DIR, ann_name)):
+                    if os.path.exists(ann_path):
                         response['annotated_url'] = f'/capture-image/{ann_name}'
                     all_results.append(response)
             except Exception as e:
@@ -899,7 +926,7 @@ def analyze_captures():
 
 @app.route('/analyze-capture', methods=['POST'])
 def analyze_capture():
-    """Run YOLOv8 analysis on a single captured image by filename."""
+    """Run Edge Impulse analysis on a single captured image by filename."""
     data = request.get_json(silent=True) or {}
     filename         = data.get('filename', '')
     annotated_name   = data.get('annotated_name', '')
@@ -911,15 +938,19 @@ def analyze_capture():
         return jsonify({'error': f'File not found: {filename}'}), 404
 
     try:
-        results = analyzer.analyze(path)
+        ann_name = annotated_name or filename.replace('.jpg', '_annotated.jpg')
+        ann_path = os.path.join(OUTPUT_DIR, os.path.basename(ann_name))
+        
+        # Analyze raw image and DRAW on the annotated one
+        results = analyzer.analyze(path, annotated_path=ann_path)
+        
         if results is None:
             return jsonify({'error': 'Could not analyze image'}), 500
+        
         response = _format_results(filename, results)
-        # Attach annotated image URL when available
-        if annotated_name:
-            response['annotated_url'] = f'/capture-image/{os.path.basename(annotated_name)}'
-        elif os.path.exists(os.path.join(OUTPUT_DIR, filename.replace('.jpg', '_annotated.jpg'))):
-            response['annotated_url'] = f'/capture-image/{filename.replace(".jpg", "_annotated.jpg")}'
+        if os.path.exists(ann_path):
+            response['annotated_url'] = f'/capture-image/{os.path.basename(ann_name)}'
+        
         return jsonify({'success': True, 'results': [response]})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1003,11 +1034,5 @@ def _format_results(filename, results):
 
 
 if __name__ == '__main__':
-    print("=" * 52)
-    print("  OralScan + Strip Scanner Backend running!")
-    print("  *** ALL FRAMES ARE RGB — NO BGR ***")
-    print("  Open: http://localhost:5000")
-    print("  GPIO  available:", _gpio_ok)
-    print("  Camera available:", USE_PICAMERA)
-    print("=" * 52 + "\n")
+    print(f"[APP] OralScan running → http://localhost:5000  |  GPIO={_gpio_ok}  camera={USE_PICAMERA}")
     app.run(debug=False, port=5000, threaded=True)
