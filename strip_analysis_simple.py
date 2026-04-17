@@ -18,7 +18,7 @@ Strip circle layout (relative to cropped strip image):
   │  [sample]   │
   └─────────────┘
 
----
+---das
 """
 
 import cv2
@@ -56,37 +56,36 @@ CIRCLE_POSITIONS = {
     'Glutathione': (0.35, 0.20),   # left circle
     'Sialic Acid': (0.35, 0.80),   # right circle
 }
-SAMPLE_RADIUS_FRAC = 0.04   # sample window = ±4% of image dimension
+SAMPLE_RADIUS_FRAC = 0.07   # larger window (7%) for better color stability
 
 
 def blueness_to_pct(r, g, b):
     """
     Map RGB → concentration (1-95%) using red/blue dominance.
-
-    - Clearly blueish shades (b > r) map towards 95%
-    - Red-dominant shades (r > b) map towards 1-5%
+    Includes a 'Purity Check': if Red is still 'spotable' (high R value),
+    we cap the result below 95%.
     """
-    r = float(r)
-    g = float(g)
-    b = float(b)
+    r, g, b = float(r), float(g), float(b)
 
-    # Calculate effective blue and red by removing common brightness (green)
-    # This helps isolate the actual dye color from ambient white light.
-    r_eff = max(0.0, r - GREEN_SUPPRESS * g)
-    b_eff = max(0.0, b - GREEN_SUPPRESS * g)
+    # Use a direct ratio of Blue to Red
+    ratio = b / (r + 1.0)
 
-    if b_eff > r_eff:
-        # Blue dominance: very steep curve.
-        # Even a 15% lead in blue (lead = 1.15) will hit 95%.
-        lead = b_eff / (r_eff + 1.0)
-        pct = 50.0 + (min(1.0, (lead - 1.0) / 0.15) * 45.0)
+    if ratio > 1.0:
+        # Blue dominant logic
+        # Purity: If R is low (<40), it's a 'Pure' blue. If R is high (>100), it's 'Spotable'.
+        # We calculate a purity factor (1.0 for pure, 0.6 for dirty purple)
+        purity = np.clip(1.0 - (max(0, r - 45) / 120.0), 0.6, 1.0)
+        
+        # Base value: ratio 1.1 hits the cap
+        val = 50.0 + (min(1.0, (ratio - 1.0) / 0.10) * 45.0)
+        
+        # Apply purity to ensure 'spotable' red doesn't hit 95%
+        final_val = 50.0 + (val - 50.0) * purity
+        return float(np.clip(final_val, 1.0, 95.0))
     else:
-        # Red dominance: quadratic curve to keep it very low (1-5%) 
-        # unless it's nearly neutral.
-        ratio = b_eff / (r_eff + 1.0)
-        pct = 1.0 + (ratio ** 2) * 49.0
-
-    return float(np.clip(pct, 1.0, 95.0))
+        # Red dominant logic: quadratic curve for the red background
+        val = 1.0 + (ratio ** 2) * 49.0
+        return float(np.clip(val, 1.0, 50.0))
 
 
 class SimpleSalivaStripAnalyzer:
@@ -144,20 +143,39 @@ class SimpleSalivaStripAnalyzer:
         return (int(m[2]), int(m[1]), int(m[0]))   # BGR → RGB
 
     def extract_rgb(self, image_bgr, bbox):
-        """Kept for backward-compat with app.py. Uses inner-60% mean."""
+        """
+        Smart Extraction: Samples the provided bounding box, but actively
+        ignores white/beige background pixels, only averaging the dark dye.
+        """
         x1, y1, x2, y2 = [int(v) for v in bbox]
         ih, iw = image_bgr.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(iw, x2), min(ih, y2)
-        dx = int((x2 - x1) * 0.20)
-        dy = int((y2 - y1) * 0.20)
-        roi = image_bgr[y1+dy:y2-dy, x1+dx:x2-dx]
-        if roi.size == 0:
-            roi = image_bgr[y1:y2, x1:x2]
+        
+        roi = image_bgr[y1:y2, x1:x2]
         if roi.size == 0:
             return (128, 128, 128)
-        m = cv2.mean(roi)[:3]
-        return (int(m[2]), int(m[1]), int(m[0]))
+            
+        # Create a mask to ignore the white/beige strip background.
+        # The strip is bright, the dye (whether red or blue) is dark.
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Keep pixels that are darker than 150 (ignores white/beige)
+        _, mask = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY_INV)
+        
+        # If the box somehow completely missed the dye (all white)
+        if cv2.countNonZero(mask) == 0:
+            # Fallback to standard center crop if no dark pixels found
+            dx = int((x2 - x1) * 0.20)
+            dy = int((y2 - y1) * 0.20)
+            roi = image_bgr[y1+dy:y2-dy, x1+dx:x2-dx]
+            if roi.size == 0: return (128, 128, 128)
+            m = cv2.mean(roi)[:3]
+            return (int(m[2]), int(m[1]), int(m[0]))
+            
+        # Calculate mean using the dark-pixel mask
+        m = cv2.mean(roi, mask=mask)[:3]
+        return (int(m[2]), int(m[1]), int(m[0])) # Return RGB
 
     # ─────────────────────────────────────────────────────────────────────────
     #  EDGE IMPULSE MODEL DETECTION  (primary when model available)
@@ -257,55 +275,189 @@ class SimpleSalivaStripAnalyzer:
             print(f"  [OK] Contour detection: {len(detections)} spot(s)")
         return sorted(detections, key=lambda d: d['center'][0])
 
-    def _detect_coloured_regions(self, image_bgr):
+    def _detect_circles_cv(self, image_bgr):
+        """
+        Multi-strategy circle detection to guarantee finding all 3 biomarker
+        circles, even when they are connected by microfluidic channels.
+        
+        Strategy 1: HoughCircles (finds circles even when connected)
+        Strategy 2: HSV blue-mask isolation (targets the dye color directly)
+        Strategy 3: Heavy erosion + contour (breaks channel connections)
+        """
         ih, iw = image_bgr.shape[:2]
-        total  = ih * iw
-        hsv    = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-
-        # Red mask
-        red_mask = cv2.bitwise_or(
-            cv2.inRange(hsv, np.array([0,   60, 50]), np.array([12,  255, 210])),
-            cv2.inRange(hsv, np.array([165, 60, 50]), np.array([180, 255, 210]))
-        )
-        # Blue/violet mask (circles: H≈100-148, S≥80)
-        blue_mask = cv2.inRange(hsv,
-                                np.array([100, 80,  50]),
-                                np.array([148, 255, 200]))
-
-        combined = cv2.bitwise_or(red_mask, blue_mask)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k, iterations=2)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  k, iterations=1)
-
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = max(50,  total * 0.0005)
-        max_area = total * 0.05        # tighter cap to avoid merged blobs
-
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+        
         detections = []
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # Strategy 1: HoughCircles — best for connected shapes
+        # ═══════════════════════════════════════════════════════════════════
+        min_r = int(min(ih, iw) * 0.04)
+        max_r = int(min(ih, iw) * 0.15)
+        circles = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1.2,
+            minDist=int(min(ih, iw) * 0.12),
+            param1=80, param2=35,
+            minRadius=min_r, maxRadius=max_r
+        )
+        
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            for cx, cy, r in circles[0]:
+                detections.append({
+                    'bbox': (int(cx-r), int(cy-r), int(cx+r), int(cy+r)),
+                    'center': (float(cx), float(cy)),
+                    'confidence': 0.9,
+                    'area': float(np.pi * r * r),
+                    'label': 'hough',
+                    'radius': int(r)
+                })
+            print(f"  [HOUGH] Found {len(detections)} circle(s)")
+        
+        if len(detections) >= 3:
+            return self._best_three(detections)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # Strategy 2: HSV blue-mask — targets the dye color directly
+        # ═══════════════════════════════════════════════════════════════════
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        # Broad blue range to catch dark blue, purple-blue, etc.
+        blue_mask = cv2.inRange(hsv, np.array([90, 40, 30]), np.array([150, 255, 255]))
+        
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        # Heavy erosion breaks channel connections between circles
+        blue_mask = cv2.erode(blue_mask, k, iterations=3)
+        blue_mask = cv2.dilate(blue_mask, k, iterations=2)
+        
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = (ih * iw) * 0.002
+        max_area = (ih * iw) * 0.10
+        
+        blue_dets = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if not (min_area <= area <= max_area):
+            if not (min_area < area < max_area):
                 continue
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            perim = cv2.arcLength(cnt, True)
-            circ  = (4 * np.pi * area / perim ** 2) if perim > 0 else 0
-            asp   = min(bw, bh) / max(bw, bh) if max(bw, bh) > 0 else 0
-            conf  = min(1.0, circ / 0.65) * 0.6 + min(1.0, asp / 0.70) * 0.4
-            if conf >= self.confidence * 0.5:
-                detections.append({
-                    'bbox':       (x, y, x + bw, y + bh),
-                    'center':     (x + bw / 2, y + bh / 2),
-                    'confidence': conf,
-                    'area':       area,
+            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            blue_dets.append({
+                'bbox': (x, y, x + w, y + h),
+                'center': (float(cx), float(cy)),
+                'confidence': 0.85,
+                'area': area,
+                'label': 'hsv_blue',
+                'radius': int(radius)
+            })
+        
+        if blue_dets:
+            print(f"  [HSV-BLUE] Found {len(blue_dets)} blue region(s)")
+            # Merge with existing detections (avoid duplicates)
+            detections = self._merge_detections(detections, blue_dets)
+        
+        if len(detections) >= 3:
+            return self._best_three(detections)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # Strategy 3: Heavy erosion on adaptive threshold
+        # ═══════════════════════════════════════════════════════════════════
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 51, 12
+        )
+        k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        # Aggressively erode to break thin channel connections
+        eroded = cv2.erode(thresh, k2, iterations=4)
+        eroded = cv2.dilate(eroded, k2, iterations=2)
+        
+        contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        erode_dets = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if not (min_area < area < max_area):
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+            if aspect > 0.4:
+                erode_dets.append({
+                    'bbox': (x, y, x + w, y + h),
+                    'center': (float(cx), float(cy)),
+                    'confidence': 0.7,
+                    'area': area,
+                    'label': 'eroded',
+                    'radius': int(radius)
                 })
+        
+        if erode_dets:
+            print(f"  [ERODE] Found {len(erode_dets)} region(s)")
+            detections = self._merge_detections(detections, erode_dets)
+        
+        print(f"  [TOTAL] {len(detections)} unique circle(s) detected across all strategies")
+        return self._best_three(detections)
+    
+    def _merge_detections(self, existing, new_dets):
+        """Merge new detections into existing, skipping duplicates within 40px."""
+        merged = list(existing)
+        for nd in new_dets:
+            nx, ny = nd['center']
+            is_dup = False
+            for ed in merged:
+                ex, ey = ed['center']
+                if np.sqrt((nx-ex)**2 + (ny-ey)**2) < 40:
+                    is_dup = True
+                    break
+            if not is_dup:
+                merged.append(nd)
+        return merged
+    
+    def _best_three(self, detections):
+        """Return the 3 best detections sorted by confidence."""
+        detections.sort(key=lambda d: d['confidence'], reverse=True)
+        return detections[:3]
 
-        if len(detections) > 3:
-            detections = sorted(detections,
-                                key=lambda d: d['confidence'],
-                                reverse=True)[:3]
-        return detections
+    def _refine_detections(self, model_dets, cv_dets):
+        """
+        Snap model 'hints' to the nearest precisely-located CV circle.
+        If model missed one, use a remaining CV circle.
+        """
+        final_dets = []
+        used_cv_idx = set()
+        
+        # 1. Try to snap each model detection to a CV circle
+        for mdet in model_dets:
+            mx, my = mdet['center']
+            best_cv = None
+            best_dist = 1000000
+            best_idx = -1
+            
+            for i, cdet in enumerate(cv_dets):
+                cx, cy = cdet['center']
+                dist = np.sqrt((mx - cx)**2 + (my - cy)**2)
+                if dist < best_dist and dist < 60: # Within 60px
+                    best_dist = dist
+                    best_cv = cdet
+                    best_idx = i
+            
+            if best_cv:
+                # Snap! Keep the model's label but use the CV box
+                mdet['bbox']   = best_cv['bbox']
+                mdet['center'] = best_cv['center']
+                used_cv_idx.add(best_idx)
+            
+            final_dets.append(mdet)
+            
+        # 2. If we have fewer than 3 detections, take the best remaining CV circles
+        if len(final_dets) < 3:
+            remaining_cv = [c for i, c in enumerate(cv_dets) if i not in used_cv_idx]
+            remaining_cv.sort(key=lambda x: x['area'], reverse=True)
+            
+            for rcv in remaining_cv:
+                if len(final_dets) >= 3: break
+                final_dets.append(rcv)
+                
+        return final_dets[:3]
 
     def classify_by_position(self, detections):
         """
@@ -397,41 +549,88 @@ class SimpleSalivaStripAnalyzer:
 
     def analyze(self, image_path, annotated_path=None):
         """
-        Main pipeline: loads image, detects circles (model or fallback),
-        samples colors, and optionally draws circles on an annotated image.
+        Robust Hybrid Pipeline: uses CV to find circles, falls back to fixed
+        positions ONLY for missing ones.
         """
         image_bgr = cv2.imread(image_path)
         if image_bgr is None:
             print(f"[ERROR] Could not load: {image_path}")
             return None
 
-        print(f"\n{'='*80}\nProcessing: {image_path}\n{'='*80}\n")
+        ih, iw = image_bgr.shape[:2]
+        print(f"\n{'='*80}\nHYBRID CV ANALYSIS: {image_path}\n{'='*80}\n")
 
-        # ── Step 1: Detect circles (Model primary, Fixed-position fallback) ──
+        # ── Step 1: Detect circles using Computer Vision ──
+        cv_dets = self._detect_circles_cv(image_bgr)
+        print(f"  [CV] Found {len(cv_dets)} circle(s) via adaptive thresholding.")
+
+        # Expected relative positions (y, x)
+        EXPECTED = {
+            'Cysteine':    (0.20, 0.50),
+            'Glutathione': (0.43, 0.24),
+            'Sialic Acid': (0.43, 0.76),
+        }
+        
         detections = []
-        if self.runner is not None:
-            print("Step 1: Running Edge Impulse model detection...")
-            detections = self._detect_with_model(image_bgr)
-
-        if detections:
-            print(f"Step 2: Sampling RGB at {len(detections)} model-detected positions...")
-            for det in detections:
-                det['rgb'] = self.extract_rgb(image_bgr, det['bbox'])
-                r, g, b = det['rgb']
-                pct = blueness_to_pct(r, g, b)
-                det['concentration_pct'] = pct
-                det['concentration_level'] = int(np.clip(round(pct / 100.0 * 19), 0, 19))
+        assigned_cv_indices = set()
+        
+        # ── Step 2: Match CV detections to expected biomarkers ──
+        for name, (ey, ex) in EXPECTED.items():
+            target_y, target_x = int(ey * ih), int(ex * iw)
+            best_cv = None
+            best_dist = 1000000
+            best_idx = -1
             
-            # Use geometric layout to assign 'Cysteine', etc.
-            self.classify_by_position(detections)
-        else:
-            print("Step 1-2: Fallback — sampling biomarker circles at fixed positions...")
-            detections = self._sample_fixed_positions(image_bgr)
+            for i, cvd in enumerate(cv_dets):
+                if i in assigned_cv_indices: continue
+                cx, cy = cvd['center']
+                dist = np.sqrt((cx - target_x)**2 + (cy - target_y)**2)
+                # If it's within a reasonable distance of the expected spot
+                if dist < (min(ih, iw) * 0.25) and dist < best_dist:
+                    best_dist = dist
+                    best_cv = cvd
+                    best_idx = i
+            
+            if best_cv:
+                # We found a real circle for this biomarker!
+                best_cv['analyte'] = name
+                detections.append(best_cv)
+                assigned_cv_indices.add(best_idx)
+                print(f"  [CV-MATCH] {name:12} @ ({best_cv['center'][0]:.0f}, {best_cv['center'][1]:.0f})")
+            else:
+                # Fallback to fixed position for this specific biomarker
+                print(f"  [FALLBACK] {name:12} @ {target_x},{target_y}")
+                r = 55 # Larger fallback box (55x55) to capture more area
+                detections.append({
+                    'analyte': name,
+                    'center':  (target_x, target_y),
+                    'bbox':    (target_x - r, target_y - r, target_x + r, target_y + r),
+                    'confidence': 0.5,
+                    'label':   'fallback'
+                })
 
-        # ── Step 3: Draw circles on annotated image if requested ──
+        # ── Step 3: Sample Colors ──
+        for det in detections:
+            # We sample the center 70% of the detected box to avoid background bleed
+            x1, y1, x2, y2 = det['bbox']
+            bw, bh = x2 - x1, y2 - y1
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            
+            # Sub-region (center 70%)
+            r_w, r_h = int(bw * 0.7), int(bh * 0.7)
+            sample_bbox = (int(cx - r_w/2), int(cy - r_h/2), int(cx + r_w/2), int(cy + r_h/2))
+            
+            det['rgb'] = self.extract_rgb(image_bgr, sample_bbox)
+            r, g, b = det['rgb']
+            pct = blueness_to_pct(r, g, b)
+            det['concentration_pct'] = pct
+            det['concentration_level'] = int(np.clip(round(pct / 100.0 * 19), 0, 19))
+
+        # ── Step 4: Draw Annotations ──
         if annotated_path and os.path.exists(annotated_path):
             self._draw_analysis_annotations(annotated_path, detections)
 
+        # ── Step 5: Format Results ──
         results = {
             'timestamp':  datetime.now().isoformat(),
             'image_path': image_path,
@@ -439,56 +638,70 @@ class SimpleSalivaStripAnalyzer:
             'biomarkers': {},
         }
 
-        print("\nStep 3: Concentrations...")
+        print("\nStep 3: Results...")
         for det in detections:
             analyte = det.get('analyte') or "Unknown"
             r, g, b  = det['rgb']
             cpct     = det['concentration_pct']
-            level    = det['concentration_level']
-            print(f"  ✓ {analyte:15} RGB=({r:3d},{g:3d},{b:3d}) → {cpct:5.1f}%")
+            print(f"  ✓ {analyte:15} RGB=({int(r):3d},{int(g):3d},{int(b):3d}) → {cpct:5.1f}%")
 
-            results['detections'].append({
-                'analyte':             analyte,
-                'symbol':              '*',
-                'confidence':          det.get('confidence', 0.9),
-                'rgb':                 det['rgb'],
-                'concentration_level': level,
-                'concentration_pct':   cpct,
-            })
             results['biomarkers'][analyte] = {
-                'concentration_level': level,
+                'concentration_level': det['concentration_level'],
                 'concentration_pct':   cpct,
             }
+            results['detections'].append({
+                'analyte':             analyte,
+                'rgb':                 det['rgb'],
+                'concentration_pct':   cpct,
+                'concentration_level': det['concentration_level'],
+                'confidence':          det.get('confidence', 0.95)
+            })
 
-        print("\nStep 4: Cancer risk...")
-        cancer = self.calculate_cancer_risk(results['biomarkers'])
-        print(f"  ✓ {cancer['emoji']} {cancer['category']}  ({cancer['percentage']:.1f}%)\n")
-        results['cancer_risk'] = cancer
-
-        self.print_report(results)
+        results['cancer_risk'] = self.calculate_cancer_risk(results['biomarkers'])
         return results
 
     def _draw_analysis_annotations(self, path, detections):
-        """Draw biomarker circles and labels on the annotated image."""
+        """Draw biomarker colored rectangles and labels on the image."""
         ann = cv2.imread(path)
         if ann is None: return
+
+        # Color mapping for analytes (BGR)
+        COLORS = {
+            'Cysteine':    (0, 255, 255),    # Yellow
+            'Glutathione': (203, 192, 255),  # Pinkish
+            'Sialic Acid': (128, 128, 128),  # Gray
+            'Unknown':     (255, 255, 255)   # White
+        }
         
         for det in detections:
-            analyte = det.get('analyte') or "Circle"
-            cx, cy = [int(v) for v in det['center']]
-            # Draw circle
-            cv2.circle(ann, (cx, cy), 15, (255, 255, 255), 2)
-            cv2.circle(ann, (cx, cy), 5,  (0, 255, 255), -1)
+            analyte = det.get('analyte') or "Unknown"
+            color = COLORS.get(analyte, COLORS['Unknown'])
             
-            # Label
+            # Use detection bbox if available, otherwise construct from center
+            if 'bbox' in det:
+                x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+            else:
+                cx, cy = [int(v) for v in det['center']]
+                r = 25
+                x1, y1, x2, y2 = cx - r, cy - r, cx + r, cy + r
+            
+            # Draw thick colored rectangle
+            cv2.rectangle(ann, (x1, y1), (x2, y2), color, 4)
+            
+            # Draw label with background for readability
             lbl = f"{analyte}: {det['concentration_pct']:.0f}%"
-            cv2.putText(ann, lbl, (cx + 20, cy + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(ann, lbl, (cx + 20, cy + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            f_scale = 0.6
+            (tw, th), _ = cv2.getTextSize(lbl, font, f_scale, 2)
+            
+            # Label background (above the box)
+            cv2.rectangle(ann, (x1, y1 - th - 12), (x1 + tw + 10, y1), color, -1)
+            # Label text
+            cv2.putText(ann, lbl, (x1 + 5, y1 - 8),
+                        font, f_scale, (0, 0, 0), 2, cv2.LINE_AA)
 
         cv2.imwrite(path, ann)
-        print(f"  [OK] Updated annotations with biomarker circles: {path}")
+        print(f"  [OK] Updated annotations with colored biomarker boxes: {path}")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  REPORT
