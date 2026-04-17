@@ -1,5 +1,6 @@
 """
 Flask Backend for OralScan Dashboard
+leoo
 """
 
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -14,7 +15,7 @@ from datetime import datetime
 from PIL import Image
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEPPER MOTOR CONFIG
+#  STEPPER MOTOR CONFIGgggggg
 # ─────────────────────────────────────────────────────────────────────────────
 USE_STEPPER   = True
 MOTOR_PINS    = [17, 18, 27, 22]   # IN1..IN4 → BCM GPIO
